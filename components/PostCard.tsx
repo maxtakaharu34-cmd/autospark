@@ -13,7 +13,9 @@ interface PostCardProps {
 export default function PostCard({ post, hashtags, index }: PostCardProps) {
   const [copied, setCopied] = useState(false);
 
-  const fullText = `${post} ${hashtags.map((t) => `#${t}`).join(" ")}`;
+  // Handle tags that may already include '#'
+  const formatTag = (t: string) => (t.startsWith("#") ? t : `#${t}`);
+  const fullText = `${post} ${hashtags.map(formatTag).join(" ")}`;
   const charCount = fullText.length;
 
   const handleCopy = async () => {
@@ -44,7 +46,7 @@ export default function PostCard({ post, hashtags, index }: PostCardProps) {
               key={tag}
               className="text-xs text-[#2563EB] bg-blue-50 px-2 py-1 rounded"
             >
-              #{tag}
+              {tag.startsWith("#") ? tag : `#${tag}`}
             </span>
           ))}
         </div>
