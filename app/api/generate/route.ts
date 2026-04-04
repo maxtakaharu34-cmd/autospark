@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
 
 interface GenerateRequest {
   industry: string;
@@ -19,9 +18,7 @@ export async function POST(request: NextRequest) {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey || apiKey === "your_key_here") {
       return NextResponse.json(
-        {
-          error: `ANTHROPIC_API_KEY is not configured (key starts with: ${apiKey ? apiKey.substring(0, 10) + "..." : "undefined"})`,
-        },
+        { error: "ANTHROPIC_API_KEY is not configured" },
         { status: 500 }
       );
     }
@@ -35,8 +32,6 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
-
-    const client = new Anthropic({ apiKey });
 
     const systemPrompt = `あなたはSNSマーケティングの専門家です。
 以下の情報をもとに、X（Twitter）用の投稿文を${count}本生成してください。
@@ -57,21 +52,41 @@ export async function POST(request: NextRequest) {
 JSON配列で返してください。JSON以外のテキストは含めないでください。
 [{"post": "投稿文", "hashtags": ["タグ1", "タグ2"]}]`;
 
-    const message = await client.messages.create({
-      model: "claude-3-haiku-20240307",
-      max_tokens: 2048,
-      messages: [
-        {
-          role: "user",
-          content: "上記の条件に従って投稿文を生成してください。",
-        },
-      ],
-      system: systemPrompt,
+    // Call Anthropic API directly via fetch
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 2048,
+        system: systemPrompt,
+        messages: [
+          {
+            role: "user",
+            content: "上記の条件に従って投稿文を生成してください。",
+          },
+        ],
+      }),
     });
 
+    const data = await response.json();
+
+    if (!response.ok) {
+      return NextResponse.json(
+        { error: `API error (${response.status}): ${JSON.stringify(data)}` },
+        { status: 500 }
+      );
+    }
+
     // Extract text content from response
-    const textContent = message.content.find((c) => c.type === "text");
-    if (!textContent || textContent.type !== "text") {
+    const textContent = data.content?.find(
+      (c: { type: string }) => c.type === "text"
+    );
+    if (!textContent) {
       return NextResponse.json(
         { error: "No text response from AI" },
         { status: 500 }
