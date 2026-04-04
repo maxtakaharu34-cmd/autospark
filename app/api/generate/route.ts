@@ -17,9 +17,11 @@ interface PostItem {
 export async function POST(request: NextRequest) {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
+    if (!apiKey || apiKey === "your_key_here") {
       return NextResponse.json(
-        { error: "ANTHROPIC_API_KEY is not configured" },
+        {
+          error: `ANTHROPIC_API_KEY is not configured (key starts with: ${apiKey ? apiKey.substring(0, 10) + "..." : "undefined"})`,
+        },
         { status: 500 }
       );
     }
