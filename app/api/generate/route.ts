@@ -56,7 +56,7 @@ JSON配列で返してください。JSON以外のテキストは含めないで
 [{"post": "投稿文", "hashtags": ["タグ1", "タグ2"]}]`;
 
     const message = await client.messages.create({
-      model: "claude-sonnet-4-5-20250514",
+      model: "claude-3-haiku-20240307",
       max_tokens: 2048,
       messages: [
         {
