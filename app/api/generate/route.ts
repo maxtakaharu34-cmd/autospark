@@ -56,7 +56,7 @@ JSON配列で返してください。JSON以外のテキストは含めないで
 [{"post": "投稿文", "hashtags": ["タグ1", "タグ2"]}]`;
 
     const message = await client.messages.create({
-      model: "claude-sonnet-4-5-20250514",
+      model: "claude-3-5-sonnet-20241022",
       max_tokens: 2048,
       messages: [
         {
@@ -96,6 +96,9 @@ JSON配列で返してください。JSON以外のテキストは含めないで
   } catch (error) {
     console.error("Generation error:", error);
 
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+
     if (error instanceof SyntaxError) {
       return NextResponse.json(
         { error: "Failed to parse AI response" },
@@ -104,7 +107,7 @@ JSON配列で返してください。JSON以外のテキストは含めないで
     }
 
     return NextResponse.json(
-      { error: "Failed to generate posts. Please try again." },
+      { error: `Generation failed: ${errorMessage}` },
       { status: 500 }
     );
   }
