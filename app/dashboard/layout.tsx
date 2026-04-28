@@ -1,35 +1,36 @@
-import Link from "next/link";
 import { ReactNode } from "react";
+import Link from "next/link";
 import { requireAdminPage } from "@/lib/api/auth-guard";
+import { DashboardNav } from "@/components/dashboard/nav";
 
 export default async function DashboardLayout({ children }: { children: ReactNode }) {
   const { email } = await requireAdminPage();
   return (
-    <div className="min-h-screen flex">
-      <aside className="w-60 border-r bg-muted/30 p-4 flex flex-col gap-1">
-        <div className="px-2 py-3 text-lg font-bold">
-          <span className="text-[#2563EB]">Auto</span>
-          <span className="text-[#F97316]">Spark</span>
-        </div>
-        <NavLink href="/dashboard" label="ホーム" />
-        <NavLink href="/dashboard/compose" label="投稿作成" />
-        <NavLink href="/dashboard/clients" label="クライアント" />
-        <div className="mt-auto text-xs text-muted-foreground px-2 py-3 border-t">
-          {email}
-        </div>
-      </aside>
-      <main className="flex-1 p-6">{children}</main>
-    </div>
-  );
-}
+    <div className="min-h-screen bg-muted/20">
+      <div className="flex min-h-screen">
+        <aside className="w-64 border-r bg-background flex flex-col">
+          <Link href="/dashboard" className="px-6 py-5 border-b">
+            <div className="text-xl font-bold leading-tight">
+              <span className="text-[#2563EB]">Auto</span>
+              <span className="text-[#F97316]">Spark</span>
+            </div>
+            <p className="text-[11px] text-muted-foreground mt-0.5">Operator Console</p>
+          </Link>
 
-function NavLink({ href, label }: { href: string; label: string }) {
-  return (
-    <Link
-      href={href}
-      className="px-3 py-2 rounded-md text-sm hover:bg-accent hover:text-accent-foreground"
-    >
-      {label}
-    </Link>
+          <div className="py-4 flex-1">
+            <DashboardNav />
+          </div>
+
+          <div className="border-t px-4 py-3 text-xs">
+            <div className="font-medium truncate">{email}</div>
+            <div className="text-muted-foreground">運営者ログイン中</div>
+          </div>
+        </aside>
+
+        <main className="flex-1 overflow-x-auto">
+          <div className="max-w-6xl mx-auto px-8 py-8">{children}</div>
+        </main>
+      </div>
+    </div>
   );
 }

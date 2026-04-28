@@ -1,4 +1,10 @@
+import Link from "next/link";
 import { supabaseAdmin } from "@/lib/supabase/admin";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { PageHeader } from "@/components/dashboard/page-header";
+import { StatCard } from "@/components/dashboard/stat-card";
+import { PlanBadge, StatusBadge, SeverityBadge } from "@/components/dashboard/plan-badge";
 import type { ClientRow, ErrorLogRow, ScheduledPostRow } from "@/lib/supabase/types";
 
 export const dynamic = "force-dynamic";
@@ -10,7 +16,7 @@ export default async function DashboardHome() {
   const endOfDay = new Date(startOfDay);
   endOfDay.setUTCDate(endOfDay.getUTCDate() + 1);
 
-  const [{ data: clients }, { data: scheduled }, { data: errors }] = await Promise.all([
+  const [{ data: clients }, { data: scheduled }, { data: errors }, { count: postsToday }] = await Promise.all([
     db.from("clients").select("*").order("created_at", { ascending: false }).limit(20),
     db.from("scheduled_posts")
       .select("*")
@@ -22,95 +28,141 @@ export default async function DashboardHome() {
       .eq("resolved", false)
       .order("created_at", { ascending: false })
       .limit(15),
+    db.from("post_history").select("*", { count: "exact", head: true }).gte("posted_at", startOfDay),
   ]);
+
+  const clientList = (clients ?? []) as ClientRow[];
+  const scheduledList = (scheduled ?? []) as ScheduledPostRow[];
+  const errorList = (errors ?? []) as ErrorLogRow[];
+  const criticalCount = errorList.filter((e) => e.severity === "critical").length;
 
   return (
     <div className="space-y-8">
-      <header>
-        <h1 className="text-2xl font-bold">ホーム</h1>
-        <p className="text-sm text-muted-foreground">運用全体のサマリーと当日のタイムライン</p>
-      </header>
+      <PageHeader
+        title="ホーム"
+        description="運用全体のサマリーと当日のタイムライン"
+        actions={
+          <Link href="/dashboard/compose">
+            <Button>新規投稿</Button>
+          </Link>
+        }
+      />
 
-      <section>
-        <h2 className="font-semibold mb-2">クライアント ({clients?.length ?? 0})</h2>
-        <ClientList clients={(clients ?? []) as ClientRow[]} />
+      <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard label="クライアント" value={clientList.length} />
+        <StatCard label="今日の投稿予定" value={scheduledList.length} />
+        <StatCard label="本日の投稿実績" value={postsToday ?? 0} tone="success" />
+        <StatCard
+          label="未解決エラー"
+          value={errorList.length}
+          tone={criticalCount > 0 ? "danger" : errorList.length > 0 ? "warning" : "default"}
+          delta={criticalCount > 0 ? `critical: ${criticalCount}` : undefined}
+        />
       </section>
 
-      <section>
-        <h2 className="font-semibold mb-2">本日の投稿予定 ({scheduled?.length ?? 0})</h2>
-        <ScheduleTimeline rows={(scheduled ?? []) as ScheduledPostRow[]} />
-      </section>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>本日のタイムライン</CardTitle>
+            <CardDescription>予約済みの投稿（時刻順）</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {scheduledList.length === 0 ? (
+              <p className="text-sm text-muted-foreground py-6 text-center">本日の投稿予定はありません。</p>
+            ) : (
+              <ul className="space-y-2">
+                {scheduledList.map((s) => (
+                  <li
+                    key={s.id}
+                    className="flex items-center gap-4 px-3 py-2.5 rounded-md hover:bg-muted/50"
+                  >
+                    <span className="font-mono text-sm text-muted-foreground w-14 shrink-0">
+                      {new Date(s.scheduled_at).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                    <span className="text-xs uppercase font-semibold text-muted-foreground w-20 shrink-0">
+                      {s.platform}
+                    </span>
+                    <span className="text-sm flex-1 truncate">
+                      {s.payload.text ?? s.payload.caption ?? s.payload.action}
+                    </span>
+                    <StatusBadge status={s.status} />
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
 
-      <section>
-        <h2 className="font-semibold mb-2">未解決のエラー ({errors?.length ?? 0})</h2>
-        <ErrorList rows={(errors ?? []) as ErrorLogRow[]} />
-      </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>クライアント</CardTitle>
+            <CardDescription>{clientList.length} 件</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {clientList.length === 0 ? (
+              <p className="text-sm text-muted-foreground py-4">
+                未登録です。
+                <Link href="/dashboard/clients" className="text-primary ml-1 underline">
+                  追加 →
+                </Link>
+              </p>
+            ) : (
+              <ul className="space-y-1">
+                {clientList.slice(0, 8).map((c) => (
+                  <li key={c.id}>
+                    <Link
+                      href={`/dashboard/clients/${c.id}`}
+                      className="flex items-center justify-between px-2 py-2 rounded-md hover:bg-muted/50 text-sm"
+                    >
+                      <span className="font-medium truncate">{c.name}</span>
+                      <PlanBadge plan={c.plan} />
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>未解決のエラー</CardTitle>
+          <CardDescription>error_logs の resolved=false</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {errorList.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-4">未解決のエラーはありません。</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-xs uppercase text-muted-foreground">
+                    <th className="text-left font-medium py-2 pr-4">時刻</th>
+                    <th className="text-left font-medium py-2 pr-4">レベル</th>
+                    <th className="text-left font-medium py-2 pr-4">種別</th>
+                    <th className="text-left font-medium py-2">メッセージ</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {errorList.map((e) => (
+                    <tr key={e.id}>
+                      <td className="py-2 pr-4 font-mono text-xs text-muted-foreground whitespace-nowrap">
+                        {new Date(e.created_at).toLocaleString("ja-JP")}
+                      </td>
+                      <td className="py-2 pr-4">
+                        <SeverityBadge severity={e.severity} />
+                      </td>
+                      <td className="py-2 pr-4 text-xs">{e.kind}</td>
+                      <td className="py-2 text-muted-foreground truncate max-w-md">{e.message}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
-}
-
-function ClientList({ clients }: { clients: ClientRow[] }) {
-  if (clients.length === 0) {
-    return <p className="text-sm text-muted-foreground">クライアントが未登録です。</p>;
-  }
-  return (
-    <ul className="divide-y border rounded-md bg-card">
-      {clients.map((c) => (
-        <li key={c.id} className="px-4 py-3 text-sm flex justify-between">
-          <span>{c.name}</span>
-          <span className="text-muted-foreground">{c.plan}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function ScheduleTimeline({ rows }: { rows: ScheduledPostRow[] }) {
-  if (rows.length === 0) {
-    return <p className="text-sm text-muted-foreground">本日の投稿予定はありません。</p>;
-  }
-  return (
-    <ul className="space-y-1 text-sm">
-      {rows.map((r) => (
-        <li key={r.id} className="flex gap-3">
-          <span className="font-mono text-muted-foreground">
-            {new Date(r.scheduled_at).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}
-          </span>
-          <span>{r.platform.toUpperCase()}</span>
-          <span className="text-muted-foreground">{r.status}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function ErrorList({ rows }: { rows: ErrorLogRow[] }) {
-  if (rows.length === 0) {
-    return <p className="text-sm text-muted-foreground">未解決のエラーはありません。</p>;
-  }
-  return (
-    <ul className="text-sm space-y-1">
-      {rows.map((e) => (
-        <li key={e.id} className="flex gap-3">
-          <span className="font-mono text-xs text-muted-foreground">
-            {new Date(e.created_at).toLocaleString("ja-JP")}
-          </span>
-          <span className={severityClass(e.severity)}>{e.severity}</span>
-          <span>{e.kind}</span>
-          <span className="text-muted-foreground truncate">{e.message}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function severityClass(severity: ErrorLogRow["severity"]) {
-  switch (severity) {
-    case "critical":
-      return "text-red-600 font-semibold";
-    case "warning":
-      return "text-amber-600";
-    default:
-      return "text-muted-foreground";
-  }
 }
