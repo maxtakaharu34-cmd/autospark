@@ -83,50 +83,74 @@ NextAuth + Google でログインし、`clients` は単なるデータ行とし�
 
 ## 4. データモデル変更（新規マイグレーション `0002_tenant_phase1.sql`）
 
-### 4.1 `clients` への追加列
+### 4.1 `clients` への追加列（マイグレーション 0003）
 ```sql
 alter table clients
-  add column auth_user_id uuid unique references auth.users(id) on delete set null;
+  add column auth_user_id uuid unique references auth.users(id) on delete set null,
+  add column invited_at timestamptz;   -- 運用者が招待を送った時刻（招待制ゲート）
 -- ログインユーザーと client の 1:1 紐付け。未連携の client は NULL（運用者が後で招待）。
+
+-- email を一意化（email→client を一意に解決するため。既存重複があれば事前クリーンが必要）
+create unique index clients_email_unique on clients (lower(email)) where email is not null;
 ```
 
-### 4.2 `scheduled_posts` の状態拡張
+### 4.2 `scheduled_posts` の状態拡張（**承認状態は専用の `approved` を新設**）
+レビュー指摘により、承認状態を既存 `pending` に流用するのは**廃止**する。理由:
+cron は transient 失敗時に `status` を `pending` へ戻す（`auto-post/route.ts:106`）ため、
+`pending` を「承認済み」に流用すると「承認済み・初回待ち」「運用者が直接作った pending」
+「失敗してリトライ中」が区別できず、承認ゲートを迂回する経路が生まれる。
+
+そこで **`approved` を新しい enum 値として追加**し、cron は `approved` のみを拾うよう変更する。
+
 ```sql
+-- (マイグレーション 0002: enum 値追加のみ。下記 4.4 参照)
 alter type scheduled_status add value 'draft';
 alter type scheduled_status add value 'pending_approval';
+alter type scheduled_status add value 'approved';
 alter type scheduled_status add value 'rejected';
 
+-- (マイグレーション 0003: 列追加・ポリシー)
 alter table scheduled_posts
-  add column approval_note text,        -- 顧客の却下理由・コメント
+  add column approval_note text,        -- 顧客のコメント（却下理由を含む）
   add column approved_at timestamptz,
   add column approved_by uuid;          -- auth.users(id)（顧客）
 ```
-> 注: `alter type ... add value` は別トランザクションでのコミットが必要。マイグレーションは
-> enum 追加と列追加を分割実行する（Supabase migration の慣例に従う）。
 
 #### 状態遷移
 ```
-draft ──(運用者が提出)──► pending_approval ──(顧客 承認)──► approved(=pending) ──(cron)──► running ─► succeeded/failed
-                                          └─(顧客 却下)──► rejected ──(運用者が修正)─► pending_approval
+draft ──(運用者が提出)──► pending_approval ──(顧客 承認)──► approved ──(cron が拾う)──► running
+                                          │                                            │
+                                          └─(顧客 却下)──► rejected                   ├─► succeeded
+                                                            │                          ├─► failed (attempts>=3)
+                                                            └─(運用者が修正)─► pending_approval
+                                                                                       └─► approved (transient失敗でリトライ; 再承認不要)
+running 失敗(attempts<3) ──► approved  （※ pending ではなく approved に戻す = 既に承認済みのため）
 ```
-- 「approved」は既存の `pending` を流用する（cron は `pending` を拾うため改修最小）。
-  → 承認＝`status` を `pending` にし `approved_at/by` を埋める。
-- これにより **cron auto-post の本体ロジックはほぼ無改修**（拾う条件は現状維持）。
-  唯一の変更は、運用者が直接 `pending` を作っていた箇所を `draft`/`pending_approval`
-  経由にする運用フロー側。
 
-### 4.3 RLS: 顧客向け読み取り + 限定書き込みポリシー
+#### cron への変更（最小・1 行）
+- `auto-post/route.ts:63` の `.in("status", ["pending"])` を **`.in("status", ["approved"])`** に変更。
+- transient 失敗時のリセット先（同 :106 `status: finalFailure ? "failed" : "pending"`）を
+  **`"approved"`** に変更（承認済みなので再承認なしでリトライ）。
+- これだけで「承認済みのみ実投稿」が **DB の状態で保証**される。運用者が直接 `approved` を
+  作らない限り（UI 上はそうしない）、承認ゲートは迂回されない。
+- 既存の `pending` は Phase 1 では未使用化（または運用者直投稿用に温存だが UI からは作らない）。
+
+### 4.3 RLS: 顧客向けは **読み取り専用**（書き込みはサーバ側 Server Action）
 ヘルパー関数で「現在のログインユーザーの client_id 群」を解決する。
+**`security definer` には `search_path` を固定**する（権限昇格対策・Supabase 必須慣行）。
 ```sql
 create or replace function current_client_ids()
-returns setof uuid language sql stable security definer as $$
-  select id from clients where auth_user_id = auth.uid();
+returns setof uuid
+language sql stable security definer
+set search_path = ''        -- 重要: 検索パス固定。schema 修飾で参照する
+as $$
+  select id from public.clients where auth_user_id = (select auth.uid());
 $$;
 ```
 
-各テーブルに **authenticated ロール限定**のポリシーを追加（anon は引き続き全拒否）:
+各テーブルに **authenticated ロール限定の SELECT ポリシーのみ**を追加（anon は引き続き全拒否）:
 ```sql
--- 例: post_history（顧客は自分の実績を閲覧のみ）
+-- post_history（顧客は自分の実績を閲覧のみ）
 create policy client_select_post_history on post_history
   for select to authenticated
   using (client_id in (select current_client_ids()));
@@ -136,24 +160,47 @@ create policy client_select_self on clients
   for select to authenticated
   using (id in (select current_client_ids()));
 
--- scheduled_posts: 顧客は pending_approval の自分の行を閲覧 + 承認/却下の update のみ
+-- scheduled_posts（顧客は自分の行を閲覧のみ）
 create policy client_select_scheduled on scheduled_posts
   for select to authenticated
   using (client_id in (select current_client_ids()));
-
-create policy client_update_approval on scheduled_posts
-  for update to authenticated
-  using (client_id in (select current_client_ids()))
-  with check (client_id in (select current_client_ids()));
 ```
-- **書き込みは承認/却下の update に限定**。INSERT/DELETE は顧客に与えない。
+
+#### 書き込み（承認/却下）は **顧客の anon JWT に UPDATE 権限を与えない**
+レビュー指摘の通り、`authenticated` に UPDATE 権限を与えると、顧客は PostgREST に直接
+アクセスして自分の行の `status` を `succeeded`/`running` 等の任意値に書き換えたり
+`approved_by` を偽装でき、承認/cron の状態機械が壊れる（RLS だけでは列・遷移を縛れない）。
+
+→ **承認/却下の書き込みは Server Action 内で service-role を用い、アプリ側で遷移を厳密検証**する
+（許可遷移: `pending_approval → approved` / `pending_approval → rejected` のみ。`client_id`
+が現在の顧客のものか、元状態が `pending_approval` か、を必ず確認）。
+顧客の anon クライアントには **INSERT / UPDATE / DELETE ポリシーを一切作らない**。
+これにより「RLS は読み取りの DB レベル backstop、書き込みは検証済み Server Action のみ」
+という一貫した不変条件になる。
+
 - `x_accounts` / `instagram_accounts`（暗号化トークン）は **顧客ポリシーを一切作らない**
   → 顧客の anon クライアントからは決して読めない。連携情報は運用者 service-role のみ。
 - `error_logs` / `api_quota_usage` も顧客ポリシーなし（運用者専用）。
-- 承認 update の列レベル制御（顧客が `status` を `pending`/`rejected` 以外に変えられない）は
-  RLS だけでは表現しづらいため、**書き込みは Server Action 経由**にして
-  アプリ側で許可された遷移のみ実行する（下記 6.3）。直接の table update 権限は
-  「将来のため」に残すが Phase 1 の UI は Server Action のみを使う。
+
+#### 読み取り時の列露出について（Phase 1 の判断）
+顧客 SELECT ポリシーは **行全体**を返す。`scheduled_posts.payload`（`target_tweet_id` 等の
+運用内部値）や `post_history.external_id` も含まれる。Phase 1 では許容するが、実装時に
+「顧客に見せる列だけを返す view または select 列の限定」を行い、内部運用フィールドを
+露出しない。これは実装計画のタスクに含める。
+
+### 4.4 マイグレーションの分割（enum 追加の制約に対応）
+Postgres では `alter type ... add value` で追加した enum 値は、**同一トランザクション内では
+使用できない**（`apply_migration` はファイル単位で 1 トランザクション）。新値を参照する
+ポリシー/CHECK/default は別マイグレーションに分ける必要がある。本 Phase では：
+
+- **`0002_scheduled_status_values.sql`**: `alter type scheduled_status add value ...` のみ（4 値）。
+- **`0003_tenant_phase1.sql`**: `clients.auth_user_id`、`scheduled_posts` の承認列、
+  `current_client_ids()` 関数、SELECT ポリシー群。新 enum 値を**文字列として参照**するのは
+  この 0003 以降（別トランザクション）なので安全。
+- 実装時、cron の `["approved"]` 参照は TypeScript 側であり DB トランザクションとは無関係。
+
+> 代替案として「enum を mutate せず `text + CHECK` 列に置き換える」も検討したが、既存
+> `0001` の enum 資産と cron の型を活かすため、分割マイグレーション方式を採用する。
 
 ---
 
@@ -184,32 +231,46 @@ export async function requireClient(): Promise<{ userId: string; client: ClientR
   `lib/supabase/client-session.ts`（route handler / middleware で cookie 設定可能版）を追加。
 
 ### middleware
-- `middleware.ts` を追加し、`/app/**` で Supabase セッション cookie のリフレッシュを行う
-  （`@supabase/ssr` の標準パターン）。`/dashboard` と `/api` は対象外。
+- 現状 `middleware.ts` は **存在せず、NextAuth も middleware を使っていない**ことを確認済み。
+  Next.js は `middleware.ts` を **1 ファイルしか持てない**ため、新規追加で衝突しない。
+- `middleware.ts` を新規追加し、**`matcher` で `/app/**` のみ**を対象に Supabase セッション
+  cookie をリフレッシュ（`@supabase/ssr` 標準パターン）。`/dashboard`・`/api` はマッチさせず
+  既存挙動を完全に温存する。
+- 将来 NextAuth 側で middleware が必要になった場合は、単一の middleware 内で
+  パスプレフィックスにより分岐する設計に統合する（Phase 1 では不要）。
 
 ---
 
 ## 6. コンポーネント設計
 
 ### 6.1 顧客ログイン（`/app/login` + `/app/auth/callback`）
-- メール入力 → `supabase.auth.signInWithOtp({ email })` でマジックリンク送信。
+- メール入力 → `supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: false } })`。
+  - **`shouldCreateUser: false`** にし、未知 email でのアカウント自動作成・メール濫用
+    （送信クォータ消費）を防ぐ。送信前にサーバ側で「招待済み（`clients.invited_at IS NOT NULL`
+    かつ email 一致）」を確認し、未招待ならリンクを送らない。
 - リンク着地 → callback route でセッション確立 → `/app` へ。
-- **重要**: マジックリンクでログインできるのは、その email が `clients.email` に存在し
-  かつ運用者が「招待済み」の場合のみ。未知の email がサインアップしても `client` に
-  紐付かない（= データは一切見えない / 「準備中」画面）。これで公開登録を作らずに
-  招待制を実現する。
+- ログイン済みでも `client` 未連携なら「準備中」画面（データは RLS でゼロ件）。
 
 ### 6.2 顧客の招待（運用者側、`/dashboard/clients/[id]`）
-- 運用者が client 詳細で「顧客を招待」→ `clients.email` 宛にマジックリンク送付。
-- 初回ログイン時に `clients.auth_user_id` を当該 `auth.users.id` で埋める
-  （callback で email 一致 client を探して紐付け。1:1 制約で二重紐付け防止）。
+- `clients` に **`invited_at timestamptz`** を追加（招待の明示フラグ。0003 に含める）。
+- 運用者が client 詳細で「顧客を招待」→ `invited_at` を記録し、`clients.email` 宛に
+  マジックリンク（または Supabase invite）を送付。
+- 初回ログイン時の紐付け（callback、service-role で実行）:
+  - email 一致 client を検索し、**`auth_user_id IS NULL` の場合のみ**当該 `auth.users.id` を設定。
+    既に設定済みなら上書きしない（取り違え・乗っ取り防止）。
+  - `clients.email` に **unique 制約**を追加（0003）し、email→client が一意に定まることを保証。
+  - `auth_user_id` の unique 制約と併せ、1 auth ユーザー ↔ 1 client を両側から担保。
 
 ### 6.3 承認キュー（`/app/approvals`）
 - `pending_approval` の自分の `scheduled_posts` を一覧表示（本文プレビュー + 予定日時）。
-- アクション = Server Action:
-  - `approvePost(id)`: 状態 `pending_approval → pending`、`approved_at/by` 記録。
-  - `rejectPost(id, note)`: 状態 `pending_approval → rejected`、`approval_note` 記録。
-- Server Action 内で **遷移の妥当性を検証**（元が `pending_approval` か、自分の client か）。
+- アクション = **Server Action（service-role を使用し、サーバ側で厳密検証）**:
+  - `approvePost(id)`: `pending_approval → approved`、`approved_at` = now, `approved_by` = 現在の auth uid。
+  - `rejectPost(id, note)`: `pending_approval → rejected`、`approval_note` 記録。
+- Server Action 内で必ず検証:
+  1. `requireClient()` で現在の顧客 client を解決
+  2. 対象 `scheduled_posts.client_id` が **その顧客のもの**であること
+  3. 現在の `status` が **`pending_approval`** であること（不正遷移を拒否）
+- 顧客の anon JWT には書き込み権限が無い（4.3）ため、PostgREST 直叩きでの改ざんは不可能。
 - 承認/却下時に運用者へ Slack 通知（既存 `postToSlack` 再利用）。
 
 ### 6.4 実績ダッシュボード（`/app`）
@@ -228,11 +289,13 @@ export async function requireClient(): Promise<{ userId: string; client: ClientR
 - **テナント分離は RLS で DB 強制**。`/app` は anon クライアント（service-role を絶対に使わない）。
   `lib/supabase/admin.ts` は `server-only` + `app/api/**` 限定の既存ルールを維持。
 - 暗号化トークン（`*_accounts`）には顧客ポリシーを作らない＝顧客経路から不可視。
-- 承認の書き込みは Server Action で遷移を検証。RLS は「自分の client の行のみ」を担保。
+- 顧客 RLS は **SELECT のみ**（INSERT/UPDATE/DELETE ポリシー無し）。承認の書き込みは
+  service-role の Server Action で遷移・所有権を検証。顧客 anon JWT では PostgREST 直叩きでも
+  書き込み不可。`current_client_ids()` は `search_path` 固定で権限昇格を防止。
 - マジックリンクは招待制（未知 email は client 未連携で何も見えない）。
 - middleware は `/app` のみセッション処理。`/dashboard`・`/api` の既存挙動は不変。
-- **回帰防止**: 既存の運用者フロー（NextAuth + service-role + cron）は一切壊さない。
-  cron は `pending` を拾う条件を変えないため、承認済みのみ流れる。
+- **回帰防止**: 既存の運用者フロー（NextAuth + service-role）は壊さない。cron は拾う状態を
+  `pending` → `approved` に変更するため、**承認済みのみ**が実投稿される（承認ゲートの担保）。
 
 ---
 
@@ -240,9 +303,14 @@ export async function requireClient(): Promise<{ userId: string; client: ClientR
 
 - **型チェック**: `npm run typecheck`（strict, any 禁止を維持）。
 - **テナント分離テスト（最重要）**: 顧客 A のセッションで顧客 B のデータ
-  （post_history / scheduled_posts / clients / *_accounts）が読めない・書けないことを確認。
-  - Supabase の anon クライアント + 各 JWT で SELECT/UPDATE を試行し 0 件 / 拒否を検証。
-- **承認フロー**: draft → 提出 → 顧客承認 → cron が `pending` を拾って投稿、を疎通
+  （post_history / scheduled_posts / clients / *_accounts）が読めないことを確認。
+  - 顧客 anon クライアント + 各 JWT で **SELECT** → 自分の行のみ / 他テナント 0 件。
+  - 顧客 anon クライアントで **UPDATE / INSERT / DELETE を直叩き** → 全テーブルで拒否
+    （承認 update も含む。書き込みポリシーが無いことの確認）。
+  - `*_accounts`（暗号化トークン）は自テナント分も含め顧客経路で **0 件**であること。
+  - 承認 Server Action に **他テナントの post id** を渡して拒否されること（所有権検証）。
+  - 承認 Server Action に **`pending_approval` 以外**の post を渡して拒否されること（遷移検証）。
+- **承認フロー**: draft → 提出 → 顧客承認 → cron が `approved` を拾って投稿、を疎通
   （cron はローカルで `curl -H "Authorization: Bearer $CRON_SECRET"`）。
 - **却下フロー**: 却下 → 運用者が修正 → 再提出。
 - **回帰**: 既存 `/dashboard`・`/generate`・cron が従来通り動くこと。
@@ -255,7 +323,8 @@ export async function requireClient(): Promise<{ userId: string; client: ClientR
 
 | ファイル/領域 | 変更 |
 |---|---|
-| `supabase/migrations/0002_*.sql` | 新規（列追加・enum 拡張・RLS ポリシー・ヘルパー関数） |
+| `supabase/migrations/0002_scheduled_status_values.sql` | 新規（enum 値追加のみ: draft/pending_approval/approved/rejected） |
+| `supabase/migrations/0003_tenant_phase1.sql` | 新規（clients 列追加・email unique・承認列・current_client_ids()・SELECT ポリシー） |
 | `middleware.ts` | 新規（/app のセッション維持） |
 | `lib/supabase/client-session.ts` | 新規（cookie 書込可能な SSR クライアント） |
 | `lib/api/client-guard.ts` | 新規（requireClient） |
@@ -263,22 +332,24 @@ export async function requireClient(): Promise<{ userId: string; client: ClientR
 | `app/dashboard/clients/[id]` | 招待ボタン + 提出フロー追加 |
 | `app/dashboard/compose` 等 | 下書き初期 status を draft に |
 | `lib/supabase/types.ts` | 型追加（auth_user_id, 新 status, approval 列） |
-| `app/api/cron/auto-post/route.ts` | 原則無改修（`pending` のみ拾う既存挙動を維持） |
+| `app/api/cron/auto-post/route.ts` | 2 箇所変更（拾う状態を `approved` に / 失敗リトライのリセット先を `approved` に） |
 | `.env.example` | 必要なら Supabase Auth 関連の追記 |
 
 ---
 
 ## 10. リスクと未決事項
 
-- **enum 値追加のマイグレーション**: `alter type add value` はトランザクション分割が必要。
-  Supabase の `apply_migration` での実行手順を確認する。
-- **Supabase Auth と NextAuth の共存**: cookie / middleware の干渉がないか実機確認。
-- **マジックリンクのメール到達**: Supabase 標準メール or Resend SMTP 設定のどちらを使うか
-  （Phase 1 は Supabase 標準で可、ブランドメールは後）。
-- **承認の列レベル制御**: Phase 1 は Server Action に寄せる方針で確定。直接 update 権限の
-  扱いは Phase 2 で再検討。
+- **enum 値追加のマイグレーション**: 4.4 の通り 0002（値追加）/ 0003（参照）に分割で解決。
+  実装時 `apply_migration` を 2 本に分けて流す。
+- **Supabase Auth と NextAuth の共存**: middleware 未使用を確認済み（5 章）。cookie 名前空間が
+  別で衝突しない想定だが、実機で両ログイン同時保持を確認する。
+- **マジックリンクのメール到達**: Phase 1 は Supabase 標準メールで可（ブランドメールは後）。
+  `shouldCreateUser: false` + `invited_at` ゲートで濫用を防止（6.1）。
+- **既存 clients.email の重複**: unique index 追加前に重複が無いか確認・クリーン（4.1）。
 - **既存 compose UI の実装状況**: `/dashboard/compose` の現状を実装時に精査し、提出フロー
-  との接続点を確定する。
+  （初期 status=draft → 提出で pending_approval）との接続点を確定する。
+- **読み取り列露出**: 顧客 SELECT は行全体を返すため、実装時に view か select 列限定で
+  内部運用フィールド（payload 内部値・external_id 等）を露出しない（4.3）。
 
 ---
 
