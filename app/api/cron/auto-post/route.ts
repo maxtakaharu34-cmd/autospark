@@ -57,10 +57,11 @@ export const GET = withErrorBoundary(async (request) => {
   requireCronSecret(request);
   const db = supabaseAdmin();
 
+  // TODO(phase-2): reclaim stale 'running' rows (crash mid-publish leaves them stuck)
   const { data: due } = await db
     .from("scheduled_posts")
     .select("*")
-    .in("status", ["pending"])
+    .in("status", ["approved"])
     .lte("scheduled_at", new Date().toISOString())
     .order("scheduled_at")
     .limit(50);
@@ -103,7 +104,7 @@ export const GET = withErrorBoundary(async (request) => {
       const message = error instanceof Error ? error.message : String(error);
       const finalFailure = attempts >= MAX_ATTEMPTS;
       await db.from("scheduled_posts").update({
-        status: finalFailure ? "failed" : "pending",
+        status: finalFailure ? "failed" : "approved",
         attempts,
         last_error: message,
       }).eq("id", row.id);
