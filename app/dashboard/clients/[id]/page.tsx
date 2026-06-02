@@ -1,4 +1,5 @@
 import { notFound } from "next/navigation";
+import { revalidatePath } from "next/cache";
 import Link from "next/link";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { Button } from "@/components/ui/button";
@@ -37,6 +38,23 @@ async function updatePersona(clientId: string, formData: FormData) {
   await supabaseAdmin().from("clients").update({ persona }).eq("id", clientId);
 }
 
+// "顧客に提出": move this client's drafts to pending_approval
+async function submitDraftsForApproval(clientId: string) {
+  "use server";
+  await supabaseAdmin().from("scheduled_posts")
+    .update({ status: "pending_approval" })
+    .eq("client_id", clientId).eq("status", "draft");
+  revalidatePath(`/dashboard/clients/${clientId}`);
+}
+
+// "顧客を招待": mark invited so the customer can request a magic link
+async function inviteClient(clientId: string) {
+  "use server";
+  await supabaseAdmin().from("clients")
+    .update({ invited_at: new Date().toISOString() }).eq("id", clientId);
+  revalidatePath(`/dashboard/clients/${clientId}`);
+}
+
 export default async function ClientDetailPage({ params }: { params: { id: string } }) {
   const db = supabaseAdmin();
   const { data: clientRow } = await db.from("clients").select("*").eq("id", params.id).maybeSingle();
@@ -56,6 +74,8 @@ export default async function ClientDetailPage({ params }: { params: { id: strin
   const historyList = (history ?? []) as PostHistoryRow[];
 
   const updatePersonaBound = updatePersona.bind(null, client.id);
+  const submitDraftsBound = submitDraftsForApproval.bind(null, client.id);
+  const inviteClientBound = inviteClient.bind(null, client.id);
 
   return (
     <div className="space-y-8">
@@ -68,7 +88,19 @@ export default async function ClientDetailPage({ params }: { params: { id: strin
       <PageHeader
         title={client.name}
         description={client.email ?? "メール未登録"}
-        actions={<PlanBadge plan={client.plan} />}
+        actions={
+          <div className="flex items-center gap-2">
+            <form action={submitDraftsBound}>
+              <Button type="submit" variant="default" size="sm">下書きを提出</Button>
+            </form>
+            <form action={inviteClientBound}>
+              <Button type="submit" variant="outline" size="sm">
+                {client.invited_at ? "再招待" : "顧客を招待"}
+              </Button>
+            </form>
+            <PlanBadge plan={client.plan} />
+          </div>
+        }
       />
 
       <Tabs defaultValue="connect">

@@ -24,7 +24,7 @@ async function schedulePost(formData: FormData) {
       ? { action: "post", text }
       : { action: "ig_feed", caption: text, media_urls: [] },
     scheduled_at: new Date(scheduledAt).toISOString(),
-    status: "pending",
+    status: "draft",
   });
   redirect(`/dashboard/clients/${clientId}`);
 }
