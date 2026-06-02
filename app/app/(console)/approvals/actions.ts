@@ -18,9 +18,11 @@ export async function approvePost(id: string): Promise<void> {
   const { userId, client } = await requireClient();
   const row = await loadOwnedPost(id, client.id);
   assertCustomerTransition(row.status, "approved");
+  // Atomic guard: only flip if still pending_approval (defends against a concurrent
+  // submit/approve race — the status check above is read-then-write otherwise).
   await supabaseAdmin().from("scheduled_posts").update({
     status: "approved", approved_at: new Date().toISOString(), approved_by: userId,
-  }).eq("id", id);
+  }).eq("id", id).eq("status", "pending_approval");
   await postToSlack({ channel: "default", text: `:white_check_mark: ${client.name} approved post ${id}` });
   revalidatePath("/app/approvals");
 }
@@ -31,7 +33,7 @@ export async function rejectPost(id: string, note: string): Promise<void> {
   assertCustomerTransition(row.status, "rejected");
   await supabaseAdmin().from("scheduled_posts").update({
     status: "rejected", approval_note: note.slice(0, 1000),
-  }).eq("id", id);
+  }).eq("id", id).eq("status", "pending_approval");
   await postToSlack({ channel: "default", text: `:x: ${client.name} rejected post ${id}: ${note}` });
   revalidatePath("/app/approvals");
 }
