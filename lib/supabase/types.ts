@@ -6,7 +6,16 @@
 
 export type Plan = "starter" | "growth" | "enterprise" | "trial" | "suspended";
 export type Platform = "x" | "instagram";
-export type ScheduledStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";
+export type ScheduledStatus =
+  | "draft"
+  | "pending_approval"
+  | "approved"
+  | "rejected"
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
 export type Severity = "info" | "warning" | "critical";
 
 export interface ClientRow {
@@ -17,6 +26,8 @@ export interface ClientRow {
   stripe_customer_id: string | null;
   stripe_subscription_id: string | null;
   suspend_at: string | null;
+  auth_user_id: string | null;
+  invited_at: string | null;
   persona: PersonaConfig;
   created_at: string;
   updated_at: string;
@@ -62,6 +73,9 @@ export interface ScheduledPostRow {
   status: ScheduledStatus;
   attempts: number;
   last_error: string | null;
+  approval_note: string | null;
+  approved_at: string | null;
+  approved_by: string | null;
   created_at: string;
   updated_at: string;
 }
